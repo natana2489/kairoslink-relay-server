@@ -975,6 +975,33 @@ impl RendezvousServer {
         Self::send_to_sink(sink, msg_out).await;
     }
 
+    async fn send_ws_ping(sink: &mut Option<Sink>) {
+        if let Some(sink) = sink.as_mut() {
+            match sink {
+                Sink::TcpStream(s) => {
+                    let _ = s.send(Bytes::new()).await;
+                }
+                Sink::Ws(ws) => {
+                    let _ = ws.send(tungstenite::Message::Binary(Vec::new())).await;
+                }
+            }
+        }
+    }
+
+    async fn send_ws_ping_to(&mut self, addr: SocketAddr) {
+        let mut map = self.tcp_punch.lock().await;
+        if let Some(s) = map.get_mut(&try_into_v4(addr)) {
+            match s {
+                Sink::TcpStream(st) => {
+                    let _ = st.send(Bytes::new()).await;
+                }
+                Sink::Ws(ws) => {
+                    let _ = ws.send(tungstenite::Message::Binary(Vec::new())).await;
+                }
+            }
+        }
+    }
+
     #[inline]
     async fn send_to_tcp_sync(
         &mut self,
@@ -1351,9 +1378,9 @@ impl RendezvousServer {
                     Ok(_) => break,
                     Err(_) => {
                         if sink.is_some() {
-                            Self::send_to_sink(&mut sink, RendezvousMessage::new()).await;
+                            Self::send_ws_ping(&mut sink).await;
                         } else {
-                            self.send_to_tcp_keep(RendezvousMessage::new(), addr).await;
+                            self.send_ws_ping_to(addr).await;
                         }
                     }
                 }
