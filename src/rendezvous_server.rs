@@ -1268,10 +1268,25 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
+            loop {
+                match timeout(30_000, b.next()).await {
+                    Ok(Some(Ok(msg))) => {
+                        if let tungstenite::Message::Binary(bytes) = msg {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(_) => break,
+                    Err(_) => {
+                        if sink.is_some() {
+                            Self::send_to_sink(&mut sink, RendezvousMessage::new()).await;
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
