@@ -553,14 +553,65 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    if !rp.id.is_empty() {
+                        self.update_addr_sink(rp.id, addr, sink).await;
+                    }
+                    return true;
+                }
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    if rk.uuid.is_empty() || rk.pk.is_empty() {
+                        return true;
+                    }
+                    let id = rk.id;
+                    let ip = addr.ip().to_string();
+                    if id.len() < 6 {
+                        Self::send_rk_res_sink(sink, UUID_MISMATCH).await;
+                        return true;
+                    } else if !self.check_ip_blocker(&ip, &id).await {
+                        Self::send_rk_res_sink(sink, TOO_FREQUENT).await;
+                        return true;
+                    }
+                    let peer = self.pm.get_or(&id).await;
+                    let changed = {
+                        let peer = peer.read().await;
+                        if peer.uuid.is_empty() {
+                            true
+                        } else {
+                            if peer.uuid == rk.uuid {
+                                if peer.info.ip != ip && peer.pk != rk.pk {
+                                    drop(peer);
+                                    Self::send_rk_res_sink(sink, UUID_MISMATCH).await;
+                                    return true;
+                                }
+                            } else {
+                                drop(peer);
+                                Self::send_rk_res_sink(sink, UUID_MISMATCH).await;
+                                return true;
+                            }
+                            peer.uuid != rk.uuid || peer.pk != rk.pk || peer.info.ip != ip
+                        }
+                    };
+                    let mut req_pk = peer.read().await.reg_pk;
+                    if req_pk.1.elapsed().as_secs() > 6 {
+                        req_pk.0 = 0;
+                    } else if req_pk.0 > 2 {
+                        Self::send_rk_res_sink(sink, TOO_FREQUENT).await;
+                        return true;
+                    }
+                    req_pk.0 += 1;
+                    req_pk.1 = Instant::now();
+                    peer.write().await.reg_pk = req_pk;
+                    if changed {
+                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                    }
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
+                        result: register_pk_response::Result::OK.into(),
                         ..Default::default()
                     });
                     Self::send_to_sink(sink, msg_out).await;
+                    return true;
                 }
                 _ => {}
             }
@@ -610,6 +661,37 @@ impl RendezvousServer {
             ..Default::default()
         });
         socket.send(&msg_out, socket_addr).await
+    }
+
+    async fn update_addr_sink(
+        &mut self,
+        id: String,
+        socket_addr: SocketAddr,
+        sink: &mut Option<Sink>,
+    ) {
+        let request_pk = if let Some(old) = self.pm.get_in_memory(&id).await {
+            let mut old = old.write().await;
+            let ip = socket_addr.ip();
+            let ip_change = if old.socket_addr.port() != 0 {
+                ip != old.socket_addr.ip()
+            } else {
+                ip.to_string() != old.info.ip
+            } && !ip.is_loopback();
+            let request_pk = old.pk.is_empty() || ip_change;
+            if !request_pk {
+                old.socket_addr = socket_addr;
+                old.last_reg_time = Instant::now();
+            }
+            request_pk
+        } else {
+            true
+        };
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_peer_response(RegisterPeerResponse {
+            request_pk,
+            ..Default::default()
+        });
+        Self::send_to_sink(sink, msg_out).await;
     }
 
     #[inline]
@@ -840,6 +922,15 @@ impl RendezvousServer {
                 }
             }
         }
+    }
+
+    async fn send_rk_res_sink(sink: &mut Option<Sink>, res: register_pk_response::Result) {
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_pk_response(RegisterPkResponse {
+            result: res.into(),
+            ..Default::default()
+        });
+        Self::send_to_sink(sink, msg_out).await;
     }
 
     #[inline]
