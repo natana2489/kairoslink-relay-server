@@ -39,6 +39,7 @@ pub(crate) struct Peer {
     pub(crate) info: PeerInfo,
     // pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
+    pub(crate) ws_addr: Option<SocketAddr>,
 }
 
 impl Default for Peer {
@@ -53,6 +54,7 @@ impl Default for Peer {
             // user: None,
             // disabled: false,
             reg_pk: (0, get_expired_time()),
+            ws_addr: None,
         }
     }
 }
@@ -176,5 +178,15 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    pub(crate) async fn clear_ws_addr(&self, addr: SocketAddr) {
+        let map = self.map.read().await;
+        for peer in map.values() {
+            let mut w = peer.write().await;
+            if w.ws_addr == Some(addr) {
+                w.ws_addr = None;
+            }
+        }
     }
 }
