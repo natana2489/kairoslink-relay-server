@@ -57,6 +57,7 @@ enum Sink {
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
+static NEXT_WS_CONN: AtomicUsize = AtomicUsize::new(1);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
@@ -82,8 +83,8 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
-    ws_sinks: Arc<Mutex<HashMap<String, Sink>>>,
-    ws_addr_to_id: Arc<Mutex<HashMap<SocketAddr, String>>>,
+    ws_sinks: Arc<Mutex<HashMap<String, (usize, Sink)>>>,
+    ws_conn_to_id: Arc<Mutex<HashMap<usize, String>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -132,7 +133,7 @@ impl RendezvousServer {
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             ws_sinks: Arc::new(Mutex::new(HashMap::new())),
-            ws_addr_to_id: Arc::new(Mutex::new(HashMap::new())),
+            ws_conn_to_id: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -491,14 +492,15 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        conn_serial: usize,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             if ws {
                 let id_opt = self
-                    .ws_addr_to_id
+                    .ws_conn_to_id
                     .lock()
                     .await
-                    .get(&try_into_v4(addr))
+                    .get(&conn_serial)
                     .cloned();
                 if let Some(id) = id_opt {
                     self.pm.touch_by_id(&id).await;
@@ -581,12 +583,15 @@ impl RendezvousServer {
                         if ws {
                             let id = rp.id.clone();
                             if let Some(s) = sink.take() {
-                                self.ws_sinks.lock().await.insert(id.clone(), s);
+                                self.ws_sinks
+                                    .lock()
+                                    .await
+                                    .insert(id.clone(), (conn_serial, s));
                             }
-                            self.ws_addr_to_id
+                            self.ws_conn_to_id
                                 .lock()
                                 .await
-                                .insert(try_into_v4(addr), id.clone());
+                                .insert(conn_serial, id.clone());
                             self.update_addr_sink_ws(id, addr).await;
                         } else {
                             self.update_addr_sink(rp.id, addr, sink).await;
@@ -726,7 +731,7 @@ impl RendezvousServer {
 
     async fn send_to_ws_id(&self, id: &str, msg: RendezvousMessage) {
         let mut map = self.ws_sinks.lock().await;
-        if let Some(s) = map.get_mut(id) {
+        if let Some((_, s)) = map.get_mut(id) {
             if let Ok(bytes) = msg.write_to_bytes() {
                 let ok = match s {
                     Sink::TcpStream(st) => st.send(Bytes::from(bytes)).await.is_ok(),
@@ -739,16 +744,31 @@ impl RendezvousServer {
         }
     }
 
-    async fn send_ws_ping_id(&self, id: &str) {
+    async fn ping_ws_conn(&self, conn_serial: usize) -> bool {
+        let id_opt = self
+            .ws_conn_to_id
+            .lock()
+            .await
+            .get(&conn_serial)
+            .cloned();
+        let Some(id) = id_opt else {
+            return false;
+        };
         let mut map = self.ws_sinks.lock().await;
-        if let Some(s) = map.get_mut(id) {
-            let ok = match s {
-                Sink::TcpStream(st) => st.send(Bytes::new()).await.is_ok(),
-                Sink::Ws(ws) => ws.send(tungstenite::Message::Binary(Vec::new())).await.is_ok(),
-            };
-            if !ok {
-                map.remove(id);
+        match map.get_mut(&id) {
+            Some((serial, s)) if *serial == conn_serial => {
+                let ok = match s {
+                    Sink::TcpStream(st) => st.send(Bytes::new()).await.is_ok(),
+                    Sink::Ws(ws) => {
+                        ws.send(tungstenite::Message::Binary(Vec::new())).await.is_ok()
+                    }
+                };
+                if !ok {
+                    map.remove(&id);
+                }
+                ok
             }
+            _ => false,
         }
     }
 
@@ -1037,20 +1057,6 @@ impl RendezvousServer {
         }
     }
 
-    async fn send_ws_ping_to(&mut self, addr: SocketAddr) {
-        let mut map = self.tcp_punch.lock().await;
-        if let Some(s) = map.get_mut(&try_into_v4(addr)) {
-            match s {
-                Sink::TcpStream(st) => {
-                    let _ = st.send(Bytes::new()).await;
-                }
-                Sink::Ws(ws) => {
-                    let _ = ws.send(tungstenite::Message::Binary(Vec::new())).await;
-                }
-            }
-        }
-    }
-
     #[inline]
     async fn send_to_tcp_sync(
         &mut self,
@@ -1060,22 +1066,6 @@ impl RendezvousServer {
         let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
-    }
-
-    async fn send_to_tcp_keep(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut map = self.tcp_punch.lock().await;
-        if let Some(s) = map.get_mut(&try_into_v4(addr)) {
-            if let Ok(bytes) = msg.write_to_bytes() {
-                match s {
-                    Sink::TcpStream(st) => {
-                        let _ = st.send(Bytes::from(bytes)).await;
-                    }
-                    Sink::Ws(ws) => {
-                        let _ = ws.send(tungstenite::Message::Binary(bytes)).await;
-                    }
-                }
-            }
-        }
     }
 
     #[inline]
@@ -1392,6 +1382,7 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let conn_serial = NEXT_WS_CONN.fetch_add(1, Ordering::SeqCst);
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1419,7 +1410,10 @@ impl RendezvousServer {
                             if bytes.is_empty() {
                                 continue;
                             }
-                            if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                            if !self
+                                .handle_tcp(&bytes, &mut sink, addr, key, ws, conn_serial)
+                                .await
+                            {
                                 break;
                             }
                         }
@@ -1428,16 +1422,8 @@ impl RendezvousServer {
                     Err(_) => {
                         if sink.is_some() {
                             Self::send_ws_ping(&mut sink).await;
-                        } else {
-                            let id_opt = self
-                                .ws_addr_to_id
-                                .lock()
-                                .await
-                                .get(&try_into_v4(addr))
-                                .cloned();
-                            if let Some(id) = id_opt {
-                                self.send_ws_ping_id(&id).await;
-                            }
+                        } else if !self.ping_ws_conn(conn_serial).await {
+                            break;
                         }
                     }
                 }
@@ -1446,7 +1432,10 @@ impl RendezvousServer {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self
+                    .handle_tcp(&bytes, &mut sink, addr, key, ws, conn_serial)
+                    .await
+                {
                     break;
                 }
             }
@@ -1455,15 +1444,19 @@ impl RendezvousServer {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
         if ws {
-            let id_opt = self
-                .ws_addr_to_id
-                .lock()
-                .await
-                .remove(&try_into_v4(addr));
-            if let Some(id) = &id_opt {
-                self.ws_sinks.lock().await.remove(id);
+            let id_opt = self.ws_conn_to_id.lock().await.remove(&conn_serial);
+            if let Some(id) = id_opt {
+                let mut sinks = self.ws_sinks.lock().await;
+                let owned = sinks
+                    .get(&id)
+                    .map(|(serial, _)| *serial == conn_serial)
+                    .unwrap_or(false);
+                if owned {
+                    sinks.remove(&id);
+                    drop(sinks);
+                    self.pm.clear_ws_addr_by_id(&id).await;
+                }
             }
-            self.pm.clear_ws_addr(try_into_v4(addr)).await;
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())

@@ -180,23 +180,10 @@ impl PeerMap {
         self.map.read().await.contains_key(id)
     }
 
-    pub(crate) async fn clear_ws_addr(&self, addr: SocketAddr) {
+    pub(crate) async fn clear_ws_addr_by_id(&self, id: &str) {
         let map = self.map.read().await;
-        for peer in map.values() {
-            let mut w = peer.write().await;
-            if w.ws_addr == Some(addr) {
-                w.ws_addr = None;
-            }
-        }
-    }
-
-    pub(crate) async fn touch_ws_peer(&self, addr: SocketAddr) {
-        let map = self.map.read().await;
-        for peer in map.values() {
-            let mut w = peer.write().await;
-            if w.ws_addr == Some(addr) {
-                w.last_reg_time = Instant::now();
-            }
+        if let Some(peer) = map.get(id) {
+            peer.write().await.ws_addr = None;
         }
     }
 
