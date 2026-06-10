@@ -199,4 +199,11 @@ impl PeerMap {
             }
         }
     }
+
+    pub(crate) async fn touch_by_id(&self, id: &str) {
+        let map = self.map.read().await;
+        if let Some(peer) = map.get(id) {
+            peer.write().await.last_reg_time = Instant::now();
+        }
+    }
 }
