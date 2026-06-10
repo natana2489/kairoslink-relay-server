@@ -189,4 +189,14 @@ impl PeerMap {
             }
         }
     }
+
+    pub(crate) async fn touch_ws_peer(&self, addr: SocketAddr) {
+        let map = self.map.read().await;
+        for peer in map.values() {
+            let mut w = peer.write().await;
+            if w.ws_addr == Some(addr) {
+                w.last_reg_time = Instant::now();
+            }
+        }
+    }
 }
