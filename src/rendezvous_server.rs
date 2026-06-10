@@ -643,7 +643,34 @@ impl RendezvousServer {
                     req_pk.1 = Instant::now();
                     peer.write().await.reg_pk = req_pk;
                     if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        self.pm
+                            .update_pk(id.clone(), peer.clone(), addr, rk.uuid, rk.pk, ip)
+                            .await;
+                    }
+                    if ws {
+                        if let Some(s) = sink.take() {
+                            self.ws_sinks
+                                .lock()
+                                .await
+                                .insert(id.clone(), (conn_serial, s));
+                        }
+                        self.ws_conn_to_id
+                            .lock()
+                            .await
+                            .insert(conn_serial, id.clone());
+                        {
+                            let mut w = peer.write().await;
+                            w.ws_addr = Some(try_into_v4(addr));
+                            w.last_reg_time = Instant::now();
+                        }
+                        log::info!("WS peer registrado y alcanzable: {} serial={}", id, conn_serial);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_pk_response(RegisterPkResponse {
+                            result: register_pk_response::Result::OK.into(),
+                            ..Default::default()
+                        });
+                        self.send_to_ws_id(&id, msg_out).await;
+                        return true;
                     }
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
@@ -898,6 +925,12 @@ impl RendezvousServer {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr, r.ws_addr)
             };
+            log::info!(
+                "punch hole para {}: elapsed={}ms ws_addr={:?}",
+                id,
+                elapsed,
+                peer_ws_addr
+            );
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
