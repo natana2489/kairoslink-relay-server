@@ -1404,10 +1404,19 @@ impl RendezvousServer {
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             loop {
-                match timeout(30_000, b.next()).await {
+                match timeout(15_000, b.next()).await {
                     Ok(Some(Ok(msg))) => {
                         if let tungstenite::Message::Binary(bytes) = msg {
                             if bytes.is_empty() {
+                                let id_opt = self
+                                    .ws_conn_to_id
+                                    .lock()
+                                    .await
+                                    .get(&conn_serial)
+                                    .cloned();
+                                if let Some(id) = id_opt {
+                                    self.pm.touch_by_id(&id).await;
+                                }
                                 continue;
                             }
                             if !self
