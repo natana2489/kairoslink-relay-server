@@ -554,6 +554,7 @@ impl RendezvousServer {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
                         }
                     }
+                    rr.relay_server = relay_para_visor(&rr.relay_server);
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
@@ -849,7 +850,7 @@ impl RendezvousServer {
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
-            relay_server: phs.relay_server.clone(),
+            relay_server: relay_para_visor(&phs.relay_server),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -883,7 +884,7 @@ impl RendezvousServer {
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
-            relay_server: la.relay_server,
+            relay_server: relay_para_visor(&la.relay_server),
             ..Default::default()
         };
         p.set_is_local(true);
@@ -1573,6 +1574,112 @@ impl RendezvousServer {
             }
         }
         false
+    }
+}
+
+/// KairosLink: alias de relay para el lado del visor.
+///
+/// Un mismo hbbr se publica con dos nombres:
+///   - relay.kairoslink.io  directo a la IP (TCP 21117 y WSS 443).
+///   - wss.kairoslink.io    detras de Cloudflare (solo WSS 443).
+///
+/// El agente de una red que bloquea la IP del relay (caso SHD, 2026-10-23) usa
+/// wss.kairoslink.io y, como no hay -r en hbbs, propone ese mismo host como
+/// punto de encuentro del relay. El visor se conecta por TCP crudo, y por TCP
+/// Cloudflare no deja pasar el 21117: la cita nunca se arma ("deadline has
+/// elapsed"). Como los dos nombres llevan al MISMO hbbr, que empareja por uuid,
+/// alcanza con traducirle al visor el alias al nombre directo. El agente sigue
+/// entrando por Cloudflare y el visor por la IP, y se encuentran igual.
+///
+/// Solo se aplica a lo que va HACIA el visor (RelayResponse y PunchHoleResponse).
+/// Un host que no figura en la lista pasa intacto, asi que el resto del parque
+/// no cambia de comportamiento.
+///
+/// Configurable con la variable de entorno RELAY_ALIASES:
+///   "wss.kairoslink.io=relay.kairoslink.io,otro=destino"
+/// Sin la variable rige el alias de arriba. RELAY_ALIASES=- lo apaga.
+fn relay_aliases() -> &'static Vec<(String, String)> {
+    static ALIASES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    ALIASES.get_or_init(|| {
+        let raw = std::env::var("RELAY_ALIASES")
+            .unwrap_or_else(|_| "wss.kairoslink.io=relay.kairoslink.io".to_owned());
+        let lista: Vec<(String, String)> = raw
+            .split(',')
+            .filter_map(|par| {
+                let (de, a) = par.split_once('=')?;
+                let (de, a) = (de.trim().to_lowercase(), a.trim().to_owned());
+                if de.is_empty() || a.is_empty() {
+                    None
+                } else {
+                    Some((de, a))
+                }
+            })
+            .collect();
+        log::info!("relay aliases para el visor: {:?}", lista);
+        lista
+    })
+}
+
+fn relay_para_visor(relay_server: &str) -> String {
+    traducir_alias(relay_server, relay_aliases())
+}
+
+fn traducir_alias(relay_server: &str, aliases: &[(String, String)]) -> String {
+    if relay_server.is_empty() || aliases.is_empty() {
+        return relay_server.to_owned();
+    }
+    // host o host:puerto. Un IPv6 (mas de un ':') nunca es un alias: pasa intacto.
+    let (host, puerto) = match relay_server.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h, Some(p))
+        }
+        Some(_) => return relay_server.to_owned(),
+        None => (relay_server, None),
+    };
+    let host_lc = host.to_lowercase();
+    for (de, a) in aliases {
+        if *de == host_lc {
+            let nuevo = match puerto {
+                Some(p) => format!("{}:{}", a, p),
+                None => a.clone(),
+            };
+            log::info!("relay para el visor: {} -> {}", relay_server, nuevo);
+            return nuevo;
+        }
+    }
+    relay_server.to_owned()
+}
+
+#[cfg(test)]
+mod tests_relay_alias {
+    use super::traducir_alias;
+
+    fn al() -> Vec<(String, String)> {
+        vec![("wss.kairoslink.io".to_owned(), "relay.kairoslink.io".to_owned())]
+    }
+
+    #[test]
+    fn traduce_con_puerto() {
+        assert_eq!(traducir_alias("wss.kairoslink.io:21117", &al()), "relay.kairoslink.io:21117");
+    }
+
+    #[test]
+    fn traduce_sin_puerto_y_sin_importar_mayusculas() {
+        assert_eq!(traducir_alias("WSS.kairoslink.io", &al()), "relay.kairoslink.io");
+    }
+
+    #[test]
+    fn no_toca_otros_hosts() {
+        assert_eq!(traducir_alias("relay.kairoslink.io:21117", &al()), "relay.kairoslink.io:21117");
+        assert_eq!(traducir_alias("relay-eu.kairoslink.io", &al()), "relay-eu.kairoslink.io");
+        assert_eq!(traducir_alias("10.0.0.5:21117", &al()), "10.0.0.5:21117");
+        assert_eq!(traducir_alias("[::1]:21117", &al()), "[::1]:21117");
+        assert_eq!(traducir_alias("", &al()), "");
+    }
+
+    #[test]
+    fn sin_aliases_no_hace_nada() {
+        assert_eq!(traducir_alias("wss.kairoslink.io:21117", &[]), "wss.kairoslink.io:21117");
     }
 }
 
