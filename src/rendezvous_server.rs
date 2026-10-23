@@ -27,7 +27,7 @@ use hbb_common::{
     },
     tokio_util::codec::Framed,
     try_into_v4,
-    udp::FramedSocket,
+    udp::{is_sendable_udp_addr, FramedSocket},
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
@@ -48,6 +48,9 @@ enum Data {
 }
 
 const REG_TIMEOUT: i32 = 30_000;
+/// Errores de recepcion seguidos que hacen falta para dar el socket UDP por
+/// muerto y recrearlo. Un solo error nunca alcanza.
+const MAX_CONSECUTIVE_UDP_RECV_ERRORS: u32 = 10;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -243,6 +246,10 @@ impl RendezvousServer {
         key: &str,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
+        // Un datagrama que falla no es motivo para recrear el socket: recrearlo
+        // corta la senializacion de toda la flota. Solo una racha de errores de
+        // recepcion indica que el socket en si murio.
+        let mut recv_errors: u32 = 0;
         loop {
             tokio::select! {
                 _ = timer_check_relay.tick() => {
@@ -256,7 +263,9 @@ impl RendezvousServer {
                 }
                 Some(data) = rx.recv() => {
                     match data {
-                        Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
+                        Data::Msg(msg, addr) => {
+                            send_udp_to_peer(socket, msg.as_ref(), addr, "senializacion").await;
+                        }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                     }
@@ -264,14 +273,28 @@ impl RendezvousServer {
                 res = socket.next() => {
                     match res {
                         Some(Ok((bytes, addr))) => {
-                            if let Err(err) = self.handle_udp(&bytes, addr.into(), socket, key).await {
-                                log::error!("udp failure: {}", err);
-                                return LoopFailure::UdpSocket;
+                            recv_errors = 0;
+                            let addr: SocketAddr = addr.into();
+                            // Un fallo manejando un datagrama (incluido un envio
+                            // que no sale) se registra y se sigue: el loop UDP es
+                            // la senializacion de toda la flota y no puede caerse
+                            // por un paquete suelto.
+                            if let Err(err) = self.handle_udp(&bytes, addr, socket, key).await {
+                                log::error!("udp handling failed for {}: {}", addr, err);
                             }
                         }
                         Some(Err(err)) => {
-                            log::error!("udp failure: {}", err);
-                            return LoopFailure::UdpSocket;
+                            recv_errors += 1;
+                            log::error!(
+                                "udp recv failure ({}/{}): {}",
+                                recv_errors,
+                                MAX_CONSECUTIVE_UDP_RECV_ERRORS,
+                                err
+                            );
+                            if recv_errors >= MAX_CONSECUTIVE_UDP_RECV_ERRORS {
+                                log::error!("demasiados errores de recepcion seguidos, se recrea el socket udp");
+                                return LoopFailure::UdpSocket;
+                            }
                         }
                         None => {
                             // unreachable!() ?
@@ -558,11 +581,28 @@ impl RendezvousServer {
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
+                // El agente abre un socket nuevo contra la central por cada
+                // intento de conexion (rendezvous_mediator.rs, handle_punch_hole
+                // y handle_intranet_): manda `PunchHoleSent` / `LocalAddr` por
+                // ese socket y acto seguido se lo entrega a `accept_connection`
+                // para montar la sesion encima. Sin `return true` estos brazos
+                // caian al final de la funcion devolviendo `false`, y el loop de
+                // `handle_listener_inner` hacia `break`, cerrando el socket sin
+                // close handshake justo cuando el agente empezaba a usarlo. Del
+                // otro lado eso se veia como "Connection reset without closing
+                // handshake" en cada intento de conexion directa.
+                //
+                // No quedan conexiones colgadas: el loop ya corta solo por
+                // inactividad (15s en WebSocket, 30s en TCP) y `ping_ws_conn`
+                // devuelve `false` para un socket que nunca se registro, que
+                // tambien termina en `break`.
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
+                    return true;
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     allow_err!(self.handle_local_addr(la, addr, None).await);
+                    return true;
                 }
                 Some(rendezvous_message::Union::TestNatRequest(tar)) => {
                     let mut msg_out = RendezvousMessage::new();
@@ -706,6 +746,13 @@ impl RendezvousServer {
             if !request_pk {
                 old.socket_addr = socket_addr;
                 old.last_reg_time = Instant::now();
+            }
+            // El peer esta hablando por UDP: ya no es alcanzable por WS.
+            // Si no se limpia, un peer que alguna vez uso WS queda marcado
+            // para siempre y se lo sigue mandando por relay.
+            if old.ws_addr.is_some() {
+                log::info!("{} volvio a registrarse por UDP, se limpia ws_addr", id);
+                old.ws_addr = None;
             }
             let ip_change = if ip_change && old.reg_pk.0 <= 2 {
                 Some(if old.socket_addr.port() == 0 {
@@ -858,7 +905,9 @@ impl RendezvousServer {
         }
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+            // addr_a sale de AddrMangle::decode sobre bytes que manda el par: si
+            // vienen vacios o corruptos se decodifica basura, puerto 0 incluido.
+            send_udp_to_peer(socket, &msg_out, addr_a, "punch hole response").await;
         } else {
             self.send_to_tcp(msg_out, addr_a).await;
         }
@@ -890,7 +939,7 @@ impl RendezvousServer {
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+            send_udp_to_peer(socket, &msg_out, addr_a, "local addrs response").await;
         } else {
             self.send_to_tcp(msg_out, addr_a).await;
         }
@@ -903,7 +952,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         ph: PunchHoleRequest,
         key: &str,
-        ws: bool,
+        _ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
@@ -932,6 +981,18 @@ impl RendezvousServer {
                 elapsed,
                 peer_ws_addr
             );
+            if peer_ws_addr.is_none() && !is_udp_peer_addr(&peer_addr) {
+                // El par figura vivo pero no tiene por donde recibir: sin
+                // WebSocket y con una direccion UDP inservible (tipico de un
+                // agente que entro por WS sin X-Real-Port y despues perdio la
+                // conexion, o de un par recien traido de la base). Se sigue igual:
+                // el envio se descarta mas adelante y la sesion cae a relay.
+                log::warn!(
+                    "punch hole para {}: sin ws_addr y con socket_addr inservible ({}), no hay camino UDP",
+                    id,
+                    peer_addr
+                );
+            }
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -958,33 +1019,38 @@ impl RendezvousServer {
             }
 
             let mut msg_out = RendezvousMessage::new();
-            let peer_is_lan = self.is_lan(peer_addr);
-            let is_lan = self.is_lan(addr);
-            let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            let peer_is_ws = peer_ws_addr.is_some();
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) || peer_is_ws {
+            let Topology {
+                peer_eff,
+                my_eff,
+                peer_is_lan,
+                is_lan,
+                same_intranet,
+            } = topology(self.inner.mask.as_ref(), peer_addr, peer_ws_addr, addr);
+            let mut relay_server = self.get_relay_server(my_eff.ip(), peer_eff.ip());
+            // El canal de senializacion (WebSocket o UDP/TCP) no debe decidir si se
+            // intenta conexion directa: solo se fuerza relay si el NAT real es
+            // simetrico (ph.nat_type ya viene del viewer), si el cliente lo pide
+            // explicitamente con force_relay, o si el server esta en modo relay-only.
+            let force_relay = ph.force_relay;
+            let forzando_relay =
+                ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) || force_relay;
+            if forzando_relay {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
-            let same_intranet: bool = !ws
-                && !peer_is_ws
-                && (peer_is_lan && is_lan || {
-                    match (peer_addr, addr) {
-                        (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-                        (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
-                        _ => false,
-                    }
-                });
             let socket_addr = AddrMangle::encode(addr).into();
-            if same_intranet {
-                log::debug!(
-                    "Fetch local addr {:?} {:?} request from {:?}",
+            // `same_intranet` nunca pisa un relay pedido explicitamente. Antes de
+            // este cambio `same_intranet` era inalcanzable, asi que `force_relay`
+            // y ALWAYS_USE_RELAY ganaban siempre; se mantiene ese contrato.
+            if same_intranet && !forzando_relay {
+                log::info!(
+                    "punch hole para {}: misma intranet ({} <-> {}), pido FetchLocalAddr",
                     id,
-                    peer_addr,
-                    addr
+                    peer_eff,
+                    my_eff
                 );
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
@@ -1002,6 +1068,11 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    // Se propagan tal cual vienen del viewer. Un viewer viejo no los
+                    // manda: quedan en 0 / vacio y el agente se comporta como hoy.
+                    udp_port: ph.udp_port,
+                    force_relay: ph.force_relay,
+                    socket_addr_v6: ph.socket_addr_v6,
                     ..Default::default()
                 });
             }
@@ -1419,17 +1490,46 @@ impl RendezvousServer {
         let conn_serial = NEXT_WS_CONN.fetch_add(1, Ordering::SeqCst);
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+            // Solo el proxy local puede reescribir la direccion de origen. Si la
+            // conexion no viene de loopback, los headers son datos que controla
+            // el propio cliente: se ignoran y se usa la direccion real del socket.
+            // Asi el fix no depende de una regla de ufw para ser seguro.
+            let trust_forwarded_headers = is_loopback(&addr);
             let callback = |req: &Request, response: Response| {
+                if !trust_forwarded_headers {
+                    let headers = req.headers();
+                    if headers.contains_key("X-Real-IP") || headers.contains_key("X-Forwarded-For")
+                    {
+                        log::warn!(
+                            "X-Real-IP/X-Forwarded-For ignorados: la conexion viene de {}, que no es loopback",
+                            addr
+                        );
+                    }
+                    return Ok(response);
+                }
                 let headers = req.headers();
                 let real_ip = headers
                     .get("X-Real-IP")
                     .or_else(|| headers.get("X-Forwarded-For"))
                     .and_then(|header_value| header_value.to_str().ok());
                 if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
+                    // El puerto de origen real lo inyecta nginx con
+                    // `proxy_set_header X-Real-Port $remote_port;`. Sin ese header
+                    // (agente que entra directo al 21118, sin proxy delante) se
+                    // mantiene 0, que es el comportamiento historico.
+                    // El puerto importa: de este addr sale el socket_addr del
+                    // PunchHoleResponse (handle_hole_sent) y el del PunchHole que
+                    // se manda al agente, y con puerto 0 la conexion directa es
+                    // imposible.
+                    let real_port = headers
+                        .get("X-Real-Port")
+                        .and_then(|header_value| header_value.to_str().ok())
+                        .and_then(|port| port.trim().parse::<u16>().ok())
+                        .unwrap_or(0);
+                    if let Some(forwarded) = addr_from_header(ip, real_port) {
+                        addr = forwarded;
                     } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+                        log::warn!("X-Real-IP invalido ({ip}), se mantiene {addr}");
                     }
                 }
                 Ok(response)
@@ -1560,20 +1660,7 @@ impl RendezvousServer {
 
     #[inline]
     fn is_lan(&self, addr: SocketAddr) -> bool {
-        if let Some(network) = &self.inner.mask {
-            match addr {
-                SocketAddr::V4(v4_socket_addr) => {
-                    return network.contains(*v4_socket_addr.ip());
-                }
-
-                SocketAddr::V6(v6_socket_addr) => {
-                    if let Some(v4_addr) = v6_socket_addr.ip().to_ipv4() {
-                        return network.contains(v4_addr);
-                    }
-                }
-            }
-        }
-        false
+        is_lan_addr(self.inner.mask.as_ref(), addr)
     }
 }
 
@@ -1683,6 +1770,193 @@ mod tests_relay_alias {
     }
 }
 
+/// `true` si `addr` cae dentro del rango privado declarado con `--mask`.
+#[inline]
+fn is_lan_addr(mask: Option<&Ipv4Network>, addr: SocketAddr) -> bool {
+    let Some(network) = mask else {
+        return false;
+    };
+    match addr {
+        SocketAddr::V4(v4_socket_addr) => network.contains(*v4_socket_addr.ip()),
+        SocketAddr::V6(v6_socket_addr) => v6_socket_addr
+            .ip()
+            .to_ipv4()
+            .map(|v4_addr| network.contains(v4_addr))
+            .unwrap_or(false),
+    }
+}
+
+/// `true` si la conexion entrante nace en la misma maquina, es decir si el
+/// unico que pudo abrirla es el nginx local. Contempla 127.0.0.0/8, ::1 y la
+/// forma mapeada ::ffff:127.0.0.1, porque con un listener dual-stack el kernel
+/// entrega la v4 mapeada y nginx puede conectarse por cualquiera de las dos.
+#[inline]
+fn is_loopback(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .map(|v4| v4.is_loopback())
+                    .unwrap_or(false)
+        }
+    }
+}
+
+/// `true` si tiene sentido mandarle un datagrama a esta direccion de par.
+///
+/// Un par puede quedar en memoria con una direccion inservible: `Peer::default()`
+/// nace en `0.0.0.0:0` (asi se carga un peer traido de la base, que no guarda
+/// direccion), y un agente que entra por WebSocket sin `X-Real-Port` queda con
+/// puerto 0. Cuando ese par pierde el WebSocket (`ws_addr = None`) pero sigue
+/// "vivo" por `last_reg_time`, el punch hole cae al camino UDP y se intenta
+/// enviar a esa direccion: `sendto` devuelve EINVAL.
+///
+/// Loopback tambien se descarta: un par nunca es el propio servidor, y mandarle
+/// senalizacion a 127.0.0.1 solo puede ser una direccion mal derivada.
+#[inline]
+fn is_udp_peer_addr(addr: &SocketAddr) -> bool {
+    is_sendable_udp_addr(addr) && !is_loopback(addr)
+}
+
+/// `true` si la IP sirve para razonar sobre topologia de red.
+///
+/// Descarta la no especificada (`0.0.0.0` / `::`, que es como nace un par
+/// traido de la base, ver `Peer::default`) y loopback. Sin esta guarda dos
+/// pares sin direccion util compararian iguales y se declararian en la misma
+/// intranet.
+#[inline]
+fn has_routable_ip(addr: &SocketAddr) -> bool {
+    !addr.ip().is_unspecified() && !is_loopback(addr)
+}
+
+/// Direccion efectiva de un par para decidir topologia de red.
+///
+/// `socket_addr` no sirve para un agente que solo habla WebSocket: `start_tcp`
+/// del agente nunca manda `RegisterPeer`, y la rama WebSocket de `RegisterPk`
+/// solo actualiza `ws_addr` y `last_reg_time`. `socket_addr` queda con lo que
+/// haya dejado el ultimo `update_pk`, o en `0.0.0.0:0` si el par se cargo desde
+/// la base. La direccion viva de ese par es `ws_addr`.
+///
+/// El resultado se normaliza con `try_into_v4` porque los dos extremos llegan a
+/// hbbs por caminos distintos: el visor por TCP crudo al listener dual-stack
+/// (`::ffff:a.b.c.d`) y el agente por nginx, donde `addr_from_header` ya
+/// devuelve IPv4 nativa. Sin normalizar, cualquier comparacion entre ambos es
+/// un `SocketAddr::V4` contra un `SocketAddr::V6` y nunca puede dar `true`.
+fn peer_effective_addr(socket_addr: SocketAddr, ws_addr: Option<SocketAddr>) -> SocketAddr {
+    let candidate = match ws_addr {
+        Some(ws) if has_routable_ip(&ws) => ws,
+        _ => socket_addr,
+    };
+    try_into_v4(candidate)
+}
+
+/// `true` si los dos extremos salen a internet por la misma IP publica, que es
+/// la senial de que estan detras del mismo router.
+///
+/// Normaliza las dos puntas antes de comparar y exige que la IP sea utilizable:
+/// un par sin direccion (`0.0.0.0:0`) nunca cuenta como vecino de nadie.
+fn same_public_ip(a: SocketAddr, b: SocketAddr) -> bool {
+    let a = try_into_v4(a);
+    let b = try_into_v4(b);
+    has_routable_ip(&a) && has_routable_ip(&b) && a.ip() == b.ip()
+}
+
+/// Lectura de la topologia entre los dos extremos de un punch hole.
+pub(crate) struct Topology {
+    /// Direccion efectiva del agente, ya normalizada.
+    peer_eff: SocketAddr,
+    /// Direccion efectiva del visor, ya normalizada.
+    my_eff: SocketAddr,
+    peer_is_lan: bool,
+    is_lan: bool,
+    /// `true` si los dos estan detras del mismo router y conviene el camino
+    /// local (`FetchLocalAddr`) en vez del punch contra la IP publica.
+    same_intranet: bool,
+}
+
+/// Decide la topologia de red entre agente y visor.
+///
+/// Es el reemplazo del calculo que estaba embebido en `handle_punch_hole_request`
+/// y que no podia dar `same_intranet = true` en produccion por dos motivos
+/// independientes: comparaba `SocketAddr` de familias distintas, y miraba
+/// `socket_addr` en vez de `ws_addr`. Ver `peer_effective_addr` y `same_public_ip`.
+fn topology(
+    mask: Option<&Ipv4Network>,
+    peer_socket_addr: SocketAddr,
+    peer_ws_addr: Option<SocketAddr>,
+    my_addr: SocketAddr,
+) -> Topology {
+    let peer_eff = peer_effective_addr(peer_socket_addr, peer_ws_addr);
+    let my_eff = try_into_v4(my_addr);
+    let peer_is_lan = is_lan_addr(mask, peer_eff);
+    let is_lan = is_lan_addr(mask, my_eff);
+    // Dos caminos para el mismo veredicto: los dos dentro del rango privado que
+    // declara --mask (hbbs dentro de la LAN), o los dos saliendo por la misma IP
+    // publica (hbbs en internet, que es nuestro despliegue).
+    let same_intranet = (peer_is_lan && is_lan) || same_public_ip(peer_eff, my_eff);
+    Topology {
+        peer_eff,
+        my_eff,
+        peer_is_lan,
+        is_lan,
+        same_intranet,
+    }
+}
+
+/// Envia un datagrama de senalizacion a un par. Nunca propaga error: si la
+/// direccion no sirve o el envio falla, se registra y se sigue. El viewer no
+/// recibe respuesta y cae solo al camino de relay, que es la degradacion
+/// aceptable; tumbar el loop UDP no lo es.
+async fn send_udp_to_peer(
+    socket: &mut FramedSocket,
+    msg: &RendezvousMessage,
+    addr: SocketAddr,
+    what: &str,
+) -> bool {
+    if !is_udp_peer_addr(&addr) {
+        log::warn!(
+            "{}: se omite el envio UDP a {}, direccion invalida; el par queda por relay",
+            what,
+            addr
+        );
+        return false;
+    }
+    if let Err(err) = socket.send(msg, addr).await {
+        log::warn!("{}: fallo el envio UDP a {}: {}", what, addr, err);
+        return false;
+    }
+    true
+}
+
+/// Arma el SocketAddr real a partir del valor del header.
+///
+/// El codigo anterior decidia la familia con `ip.contains('.')`, asi que una
+/// direccion mapeada como `::ffff:190.245.223.51` caia en la rama IPv4, se
+/// formateaba como `::ffff:190.245.223.51:0`, no parseaba y la direccion real
+/// se perdia en silencio. Aca se parsea la IP primero y despues se arma el
+/// addr, y las v4 mapeadas se normalizan a IPv4 nativa para que el resto del
+/// server (is_lan, try_into_v4, AddrMangle) las vea igual que a las directas.
+fn addr_from_header(value: &str, port: u16) -> Option<SocketAddr> {
+    // X-Forwarded-For puede traer la cadena completa de proxies
+    // ("cliente, proxy1, proxy2"): el origen real es el primer elemento.
+    let raw = value.split(',').next()?.trim();
+    // Tolerar la forma entre corchetes que usan algunos proxies para IPv6.
+    let raw = raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw);
+    let ip = match raw.parse::<IpAddr>().ok()? {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
 async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
     let mut futs = Vec::new();
     let rs = Arc::new(Mutex::new(Vec::new()));
@@ -1779,4 +2053,357 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests_same_intranet {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// El `--mask 192.168.0.0/16` con el que corre hbbs en produccion.
+    fn mask() -> Ipv4Network {
+        "192.168.0.0/16".parse().unwrap()
+    }
+
+    /// Como entra el visor: TCP crudo al 21116, listener dual-stack, por lo que
+    /// el kernel entrega la IPv4 en forma mapeada.
+    fn visor(ip: &str, port: u16) -> SocketAddr {
+        sa(&format!("[::ffff:{ip}]:{port}"))
+    }
+
+    /// Como queda el agente: entra por nginx y `addr_from_header` ya normalizo
+    /// la direccion a IPv4 nativa.
+    fn agente_ws(ip: &str, port: u16) -> SocketAddr {
+        sa(&format!("{ip}:{port}"))
+    }
+
+    #[test]
+    fn misma_ip_publica_con_familias_distintas_es_misma_intranet() {
+        // El caso real de produccion y la regresion que motivo el fix: dos
+        // maquinas detras del mismo router. El visor llega v6-mapeado y el
+        // agente v4 nativa, y antes el `match (peer_addr, addr)` caia en
+        // `_ => false` sin comparar nada.
+        let t = topology(
+            Some(&mask()),
+            sa("0.0.0.0:0"),
+            Some(agente_ws("190.245.223.51", 51092)),
+            visor("190.245.223.51", 64661),
+        );
+        assert!(t.same_intranet, "misma IP publica debe ser misma intranet");
+        assert_eq!(t.peer_eff, sa("190.245.223.51:51092"));
+        assert_eq!(t.my_eff, sa("190.245.223.51:64661"));
+    }
+
+    #[test]
+    fn misma_ip_publica_ambas_v4_nativas() {
+        // Mismo veredicto si los dos llegaran ya normalizados.
+        let t = topology(
+            Some(&mask()),
+            agente_ws("190.245.223.51", 51092),
+            None,
+            agente_ws("190.245.223.51", 64661),
+        );
+        assert!(t.same_intranet);
+    }
+
+    #[test]
+    fn ips_publicas_distintas_no_es_misma_intranet() {
+        // Tecnico en su casa, equipo en la oficina: tiene que ir por punch
+        // hole contra la IP publica, y si falla, por relay.
+        let t = topology(
+            Some(&mask()),
+            Some(agente_ws("190.245.223.51", 51092)).unwrap(),
+            Some(agente_ws("190.245.223.51", 51092)),
+            visor("181.170.10.7", 64661),
+        );
+        assert!(!t.same_intranet);
+        assert!(!t.peer_is_lan);
+        assert!(!t.is_lan);
+    }
+
+    #[test]
+    fn ambos_dentro_del_mask_es_misma_intranet() {
+        // hbbs desplegado dentro de la LAN del cliente: los dos extremos caen
+        // en 192.168.0.0/16 aunque sean IPs distintas.
+        let t = topology(
+            Some(&mask()),
+            sa("192.168.0.50:21116"),
+            None,
+            visor("192.168.0.102", 64661),
+        );
+        assert!(t.same_intranet);
+        assert!(t.peer_is_lan);
+        assert!(t.is_lan);
+    }
+
+    #[test]
+    fn peer_sin_socket_addr_usa_ws_addr() {
+        // Un agente que solo habla WebSocket puede quedar con socket_addr en
+        // 0.0.0.0:0 (peer traido de la base, `Peer::default`). La direccion
+        // viva es ws_addr y es la que hay que mirar.
+        let t = topology(
+            Some(&mask()),
+            sa("0.0.0.0:0"),
+            Some(sa("192.168.0.50:21116")),
+            visor("192.168.0.102", 64661),
+        );
+        assert_eq!(t.peer_eff, sa("192.168.0.50:21116"));
+        assert!(t.peer_is_lan);
+        assert!(t.same_intranet);
+    }
+
+    #[test]
+    fn peer_sin_direccion_util_nunca_es_vecino() {
+        // Sin ws_addr y con socket_addr inservible no se puede afirmar nada:
+        // debe caer al camino de punch hole, que a su vez cae a relay.
+        let t = topology(
+            Some(&mask()),
+            sa("0.0.0.0:0"),
+            None,
+            visor("190.245.223.51", 64661),
+        );
+        assert!(!t.same_intranet);
+        assert_eq!(t.peer_eff, sa("0.0.0.0:0"));
+
+        // Y dos pares sin direccion tampoco comparan iguales entre si.
+        let t = topology(None, sa("0.0.0.0:0"), None, sa("0.0.0.0:0"));
+        assert!(!t.same_intranet);
+    }
+
+    #[test]
+    fn loopback_no_cuenta_como_vecino() {
+        // Si por un error de derivacion los dos quedaran en loopback, no se
+        // puede concluir que esten en la misma LAN.
+        let t = topology(None, sa("127.0.0.1:21116"), None, sa("127.0.0.1:64661"));
+        assert!(!t.same_intranet);
+    }
+
+    #[test]
+    fn ws_addr_invalida_cae_a_socket_addr() {
+        // ws_addr presente pero sin IP utilizable: se ignora y se usa lo que
+        // haya en socket_addr, sin romper la deteccion.
+        let t = topology(
+            Some(&mask()),
+            agente_ws("190.245.223.51", 51092),
+            Some(sa("0.0.0.0:0")),
+            visor("190.245.223.51", 64661),
+        );
+        assert_eq!(t.peer_eff, sa("190.245.223.51:51092"));
+        assert!(t.same_intranet);
+    }
+
+    #[test]
+    fn sin_mask_la_deteccion_por_ip_publica_sigue_viva() {
+        // El camino de misma IP publica no depende de --mask.
+        let t = topology(
+            None,
+            sa("0.0.0.0:0"),
+            Some(agente_ws("190.245.223.51", 51092)),
+            visor("190.245.223.51", 64661),
+        );
+        assert!(t.same_intranet);
+        assert!(!t.peer_is_lan);
+        assert!(!t.is_lan);
+    }
+
+    #[test]
+    fn un_solo_extremo_en_el_mask_fuerza_relay_y_no_es_intranet() {
+        // `peer_is_lan ^ is_lan` es la condicion que fuerza relay en
+        // handle_punch_hole_request. Se comprueba que sigue distinguiendo.
+        let t = topology(
+            Some(&mask()),
+            sa("192.168.0.50:21116"),
+            None,
+            visor("190.245.223.51", 64661),
+        );
+        assert!(t.peer_is_lan ^ t.is_lan, "debe forzar relay");
+        assert!(!t.same_intranet);
+    }
+}
+
+#[cfg(test)]
+mod tests_forwarded_addr {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_reconocido_en_las_tres_formas() {
+        assert!(is_loopback(&sa("127.0.0.1:33000")));
+        assert!(is_loopback(&sa("127.0.0.53:33000")));
+        assert!(is_loopback(&sa("[::1]:33000")));
+        assert!(is_loopback(&sa("[::ffff:127.0.0.1]:33000")));
+    }
+
+    #[test]
+    fn no_loopback_rechazado() {
+        assert!(!is_loopback(&sa("190.245.223.51:33000")));
+        assert!(!is_loopback(&sa("10.0.0.5:33000")));
+        assert!(!is_loopback(&sa("[2800:810:1::1]:33000")));
+        // ::ffff:0.0.0.0 y similares no son loopback aunque sean mapeadas.
+        assert!(!is_loopback(&sa("[::ffff:190.245.223.51]:33000")));
+    }
+
+    #[test]
+    fn header_ipv4_simple() {
+        assert_eq!(
+            addr_from_header("190.245.223.51", 54321),
+            Some(sa("190.245.223.51:54321"))
+        );
+    }
+
+    #[test]
+    fn header_ipv4_mapeada_se_normaliza_a_v4() {
+        // Este es el caso que antes se perdia: contiene '.', iba a la rama v4
+        // y "::ffff:190.245.223.51:0" no parseaba.
+        assert_eq!(
+            addr_from_header("::ffff:190.245.223.51", 54321),
+            Some(sa("190.245.223.51:54321"))
+        );
+        assert_eq!(
+            addr_from_header("::ffff:1.2.3.4", 4444),
+            Some(sa("1.2.3.4:4444"))
+        );
+    }
+
+    #[test]
+    fn header_ipv6_nativa() {
+        assert_eq!(
+            addr_from_header("2800:810:1::1", 54321),
+            Some(sa("[2800:810:1::1]:54321"))
+        );
+        assert_eq!(
+            addr_from_header("[2800:810:1::1]", 54321),
+            Some(sa("[2800:810:1::1]:54321"))
+        );
+    }
+
+    #[test]
+    fn header_con_cadena_de_proxies_toma_el_primero() {
+        assert_eq!(
+            addr_from_header("190.245.223.51, 10.0.0.1, 10.0.0.2", 54321),
+            Some(sa("190.245.223.51:54321"))
+        );
+    }
+
+    #[test]
+    fn header_invalido_no_pisa_la_direccion() {
+        assert_eq!(addr_from_header("no-una-ip", 54321), None);
+        assert_eq!(addr_from_header("", 54321), None);
+        assert_eq!(addr_from_header("190.245.223.51:9999", 54321), None);
+    }
+
+    #[test]
+    fn puerto_cero_cuando_no_hay_x_real_port() {
+        assert_eq!(
+            addr_from_header("190.245.223.51", 0),
+            Some(sa("190.245.223.51:0"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_udp_robustez {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    async fn socket_local() -> FramedSocket {
+        FramedSocket::new(&sa("127.0.0.1:0")).await.unwrap()
+    }
+
+    fn msg() -> RendezvousMessage {
+        let mut m = RendezvousMessage::new();
+        m.set_punch_hole_response(PunchHoleResponse::default());
+        m
+    }
+
+    /// El socket sigue vivo: manda a un receptor real y el datagrama llega.
+    async fn assert_socket_sigue_vivo(socket: &mut FramedSocket) {
+        let mut rx = socket_local().await;
+        let rx_addr = rx.local_addr().unwrap();
+        // is_udp_peer_addr descarta loopback, asi que se prueba el envio crudo.
+        socket.send(&msg(), rx_addr).await.unwrap();
+        assert!(rx.next_timeout(2_000).await.is_some());
+    }
+
+    #[test]
+    fn direccion_de_par_invalida() {
+        // El caso de produccion: par sin ws_addr cuyo socket_addr quedo en 0.
+        assert!(!is_udp_peer_addr(&sa("190.245.223.51:0")));
+        // Peer::default(), tal como se carga un par traido de la base.
+        assert!(!is_udp_peer_addr(&sa("0.0.0.0:0")));
+        assert!(!is_udp_peer_addr(&sa("0.0.0.0:21116")));
+        assert!(!is_udp_peer_addr(&sa("[::]:21116")));
+        // Un par nunca es el propio servidor.
+        assert!(!is_udp_peer_addr(&sa("127.0.0.1:21116")));
+        assert!(!is_udp_peer_addr(&sa("[::1]:21116")));
+        assert!(!is_udp_peer_addr(&sa("[::ffff:127.0.0.1]:21116")));
+        // Direcciones utiles.
+        assert!(is_udp_peer_addr(&sa("190.245.223.51:33000")));
+        assert!(is_udp_peer_addr(&sa("192.168.1.122:21116")));
+        assert!(is_udp_peer_addr(&sa("[2800:810:1::1]:21116")));
+    }
+
+    #[tokio::test]
+    async fn envio_a_puerto_cero_no_tumba_el_servidor() {
+        let mut socket = socket_local().await;
+        let enviado =
+            send_udp_to_peer(&mut socket, &msg(), sa("190.245.223.51:0"), "test").await;
+        assert!(!enviado, "no se debe intentar enviar a puerto 0");
+        assert_socket_sigue_vivo(&mut socket).await;
+    }
+
+    #[tokio::test]
+    async fn envio_a_unspecified_no_tumba_el_servidor() {
+        let mut socket = socket_local().await;
+        assert!(!send_udp_to_peer(&mut socket, &msg(), sa("0.0.0.0:0"), "test").await);
+        assert!(!send_udp_to_peer(&mut socket, &msg(), sa("0.0.0.0:21116"), "test").await);
+        assert!(!send_udp_to_peer(&mut socket, &msg(), sa("[::]:21116"), "test").await);
+        assert_socket_sigue_vivo(&mut socket).await;
+    }
+
+    /// Fallo genuino de `sendto` del SO, que la validacion no puede prever:
+    /// socket IPv4 enviando a un destino IPv6. Es el caso que exige que la
+    /// robustez no dependa de que la validacion sea perfecta.
+    #[tokio::test]
+    async fn fallo_de_send_to_no_tumba_el_servidor() {
+        let mut socket = socket_local().await;
+        let destino = sa("[2800:810:1::1]:21116");
+        assert!(is_udp_peer_addr(&destino), "la validacion lo deja pasar");
+        assert!(
+            !send_udp_to_peer(&mut socket, &msg(), destino, "test").await,
+            "el envio debe fallar en el SO y ser absorbido"
+        );
+        assert_socket_sigue_vivo(&mut socket).await;
+    }
+
+    /// Reproduce la secuencia de produccion: punch hole con ws_addr=None manda a
+    /// una direccion muerta y, acto seguido, llega un registro que hay que
+    /// responder. Antes el segundo envio heredaba el EINVAL del primero.
+    #[tokio::test]
+    async fn un_envio_fallido_no_envenena_los_siguientes() {
+        let mut socket = socket_local().await;
+        send_udp_to_peer(&mut socket, &msg(), sa("190.245.223.51:0"), "punch hole").await;
+        assert_socket_sigue_vivo(&mut socket).await;
+        for _ in 0..20 {
+            send_udp_to_peer(&mut socket, &msg(), sa("190.245.223.51:0"), "punch hole").await;
+            send_udp_to_peer(&mut socket, &msg(), sa("[2800:810:1::1]:21116"), "punch hole").await;
+        }
+        assert_socket_sigue_vivo(&mut socket).await;
+    }
+
+    #[test]
+    fn solo_una_racha_de_errores_recrea_el_socket() {
+        // Un error suelto de recepcion no debe llegar al umbral.
+        assert!(1 < MAX_CONSECUTIVE_UDP_RECV_ERRORS);
+        assert!(MAX_CONSECUTIVE_UDP_RECV_ERRORS >= 10);
+    }
 }

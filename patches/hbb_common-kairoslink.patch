@@ -1,0 +1,213 @@
+diff --git a/protos/rendezvous.proto b/protos/rendezvous.proto
+index b9b8ed7..ff1d2c4 100644
+--- a/protos/rendezvous.proto
++++ b/protos/rendezvous.proto
+@@ -16,19 +16,31 @@ enum ConnType {
+ 
+ message RegisterPeerResponse { bool request_pk = 2; }
+ 
+-message PunchHoleRequest { 
+-  string id = 1; 
++message PunchHoleRequest {
++  string id = 1;
+   NatType nat_type = 2;
+   string licence_key = 3;
+   ConnType conn_type = 4;
+   string token = 5;
+   string version = 6;
++  int32 udp_port = 7;
++  bool force_relay = 8;
++  int32 upnp_port = 9;
++  bytes socket_addr_v6 = 10;
+ }
+ 
+-message PunchHole { 
++message PunchHole {
+   bytes socket_addr = 1;
+   string relay_server = 2;
+   NatType nat_type = 3;
++  int32 udp_port = 4;
++  bool force_relay = 5;
++  int32 upnp_port = 6;
++  bytes socket_addr_v6 = 7;
++  // 8 = ControlPermissions control_permissions en el .proto del agente.
++  // No se porta el mensaje ControlPermissions (el servidor no lo genera),
++  // pero el numero queda reservado para no colisionar nunca con el agente.
++  reserved 8;
+ }
+ 
+ message TestNatRequest {
+diff --git a/src/udp.rs b/src/udp.rs
+index fbdf332..9cc9b85 100644
+--- a/src/udp.rs
++++ b/src/udp.rs
+@@ -1,5 +1,5 @@
+ use crate::ResultType;
+-use anyhow::{anyhow, Context};
++use anyhow::{anyhow, bail, Context};
+ use bytes::{Bytes, BytesMut};
+ use futures::{SinkExt, StreamExt};
+ use protobuf::Message;
+@@ -45,6 +45,40 @@ fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket,
+     Ok(socket)
+ }
+ 
++/// Envia un datagrama sin pasar por el `Sink` de `UdpFramed`.
++///
++/// Motivo: en tokio-util 0.7 `UdpFramed::poll_flush` hace
++/// `ready!(socket.poll_send_to(cx, wr, *out_addr))?` y sale por ese `?` **antes**
++/// de `wr.clear()` / `flushed = true`. Si un envio falla (destino invalido, red
++/// inalcanzable), el frame y la direccion muerta quedan pendientes dentro del
++/// `UdpFramed`, y todo envio posterior -- a cualquier destino -- vuelve a
++/// intentar ese mismo frame y falla con el mismo error hasta recrear el socket.
++/// `UdpSocket::send_to` no tiene estado pendiente: un fallo afecta solo a ese
++/// datagrama. La recepcion sigue por el Stream, que usa otro buffer (`rd`).
++#[inline]
++async fn send_to_direct(
++    f: &mut UdpFramed<BytesCodec>,
++    data: &[u8],
++    addr: SocketAddr,
++) -> ResultType<()> {
++    if !is_sendable_udp_addr(&addr) {
++        bail!("invalid udp target address: {}", addr);
++    }
++    let n = f.get_ref().send_to(data, addr).await?;
++    if n != data.len() {
++        bail!("failed to write entire datagram to socket");
++    }
++    Ok(())
++}
++
++/// `false` para destinos con los que `sendto` devuelve EINVAL siempre: puerto 0
++/// o direccion sin especificar (0.0.0.0 / ::). No filtra loopback ni LAN, que
++/// son destinos legitimos (por ejemplo el self-test de hbbs contra 127.0.0.1).
++#[inline]
++pub fn is_sendable_udp_addr(addr: &SocketAddr) -> bool {
++    addr.port() != 0 && !addr.ip().is_unspecified()
++}
++
+ impl FramedSocket {
+     pub async fn new<T: ToSocketAddrs>(addr: T) -> ResultType<Self> {
+         Self::new_reuse(addr, false, 0).await
+@@ -100,7 +134,7 @@ impl FramedSocket {
+         match self {
+             Self::Direct(f) => {
+                 if let TargetAddr::Ip(addr) = addr {
+-                    f.send((send_data, addr)).await?
++                    send_to_direct(f, &send_data, addr).await?;
+                 }
+             }
+             Self::ProxySocks(f) => f.send((send_data, addr)).await?,
+@@ -120,7 +154,7 @@ impl FramedSocket {
+         match self {
+             Self::Direct(f) => {
+                 if let TargetAddr::Ip(addr) = addr {
+-                    f.send((Bytes::from(msg), addr)).await?
++                    send_to_direct(f, msg, addr).await?;
+                 }
+             }
+             Self::ProxySocks(f) => f.send((Bytes::from(msg), addr)).await?,
+@@ -160,6 +194,15 @@ impl FramedSocket {
+         }
+     }
+ 
++    /// Solo para tests: permite forzar un fallo real de `sendto` del SO.
++    #[cfg(test)]
++    async fn send_bytes_for_test(&mut self, data: &[u8], addr: SocketAddr) -> ResultType<()> {
++        match self {
++            Self::Direct(f) => send_to_direct(f, data, addr).await,
++            Self::ProxySocks(_) => bail!("not supported"),
++        }
++    }
++
+     pub fn local_addr(&self) -> Option<SocketAddr> {
+         if let FramedSocket::Direct(x) = self {
+             if let Ok(v) = x.get_ref().local_addr() {
+@@ -169,3 +212,87 @@ impl FramedSocket {
+         None
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    async fn socket_local() -> FramedSocket {
++        FramedSocket::new(&"127.0.0.1:0".parse::<SocketAddr>().unwrap())
++            .await
++            .unwrap()
++    }
++
++    /// El socket sigue vivo y usable: se envia a un receptor real y llega.
++    async fn assert_socket_sigue_usable(s: &mut FramedSocket) {
++        let mut rx = socket_local().await;
++        let rx_addr = rx.local_addr().unwrap();
++        s.send_bytes_for_test(b"ok", rx_addr).await.unwrap();
++        let (data, _) = rx.next_timeout(2_000).await.unwrap().unwrap();
++        assert_eq!(&data[..], b"ok");
++    }
++
++    #[test]
++    fn direcciones_no_enviables() {
++        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
++        assert!(!is_sendable_udp_addr(&p("190.245.223.51:0")));
++        assert!(!is_sendable_udp_addr(&p("0.0.0.0:0")));
++        assert!(!is_sendable_udp_addr(&p("0.0.0.0:21116")));
++        assert!(!is_sendable_udp_addr(&p("[::]:21116")));
++        // Loopback y LAN si son destinos validos (self-test de hbbs, peers LAN).
++        assert!(is_sendable_udp_addr(&p("127.0.0.1:21116")));
++        assert!(is_sendable_udp_addr(&p("190.245.223.51:33000")));
++    }
++
++    #[tokio::test]
++    async fn envio_a_puerto_cero_no_rompe_el_socket() {
++        let mut s = socket_local().await;
++        let err = s
++            .send_bytes_for_test(b"x", "190.245.223.51:0".parse().unwrap())
++            .await;
++        assert!(err.is_err());
++        assert_socket_sigue_usable(&mut s).await;
++    }
++
++    #[tokio::test]
++    async fn envio_a_unspecified_no_rompe_el_socket() {
++        let mut s = socket_local().await;
++        assert!(s
++            .send_bytes_for_test(b"x", "0.0.0.0:21116".parse().unwrap())
++            .await
++            .is_err());
++        assert!(s
++            .send_bytes_for_test(b"x", "0.0.0.0:0".parse().unwrap())
++            .await
++            .is_err());
++        assert_socket_sigue_usable(&mut s).await;
++    }
++
++    /// Fallo genuino de `sendto` del SO (no filtrado por la validacion): socket
++    /// IPv4 enviando a un destino IPv6. Antes esto dejaba el frame pendiente en
++    /// el `UdpFramed` y envenenaba todos los envios siguientes.
++    #[tokio::test]
++    async fn fallo_real_de_send_to_no_rompe_el_socket() {
++        let mut s = socket_local().await;
++        let err = s
++            .send_bytes_for_test(b"x", "[2800:810:1::1]:21116".parse().unwrap())
++            .await;
++        assert!(err.is_err(), "se esperaba error del SO en send_to");
++        assert_socket_sigue_usable(&mut s).await;
++    }
++
++    /// Muchos fallos seguidos tampoco degradan el socket.
++    #[tokio::test]
++    async fn muchos_fallos_seguidos_no_rompen_el_socket() {
++        let mut s = socket_local().await;
++        for _ in 0..50 {
++            let _ = s
++                .send_bytes_for_test(b"x", "190.245.223.51:0".parse().unwrap())
++                .await;
++            let _ = s
++                .send_bytes_for_test(b"x", "[2800:810:1::1]:21116".parse().unwrap())
++                .await;
++        }
++        assert_socket_sigue_usable(&mut s).await;
++    }
++}
